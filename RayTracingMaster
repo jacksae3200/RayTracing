@@ -1,0 +1,100 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+[ExecuteInEditMode, ImageEffectAllowedInSceneView]
+public class RayTracingMaster : MonoBehaviour
+{
+    public ComputeShader rayTracingShader;
+
+    [Range(1, 32)]
+    public int maxBounces = 8;
+
+    private RenderTexture target;
+    private Camera cam;
+
+    // HLSL 구조체와 메모리 레이아웃이 1:1로 일치해야 합니다. (Vector3 12bytes + float 4bytes + Vector3 12bytes = 28bytes)
+    struct SphereData
+    {
+        public Vector3 position;
+        public float radius;
+        public Vector3 color;
+        public float smoothness;
+        public float ior;
+    }
+
+    private ComputeBuffer sphereBuffer;
+
+    private void Awake()
+    {
+        cam = GetComponent<Camera>();
+    }
+
+    private void OnDisable()
+    {
+        // 메모리 누수 방지를 위한 Buffer 해제
+        if (sphereBuffer != null)
+        {
+            sphereBuffer.Release();
+            sphereBuffer = null;
+        }
+    }
+
+    private void OnRenderImage(RenderTexture source, RenderTexture destination)
+    {
+        SetShaderParameters();
+        Render(destination);
+    }
+
+    private void SetShaderParameters()
+    {
+        rayTracingShader.SetMatrix("_CameraToWorld", cam.cameraToWorldMatrix);
+        rayTracingShader.SetMatrix("_CameraInverseProjection", cam.projectionMatrix.inverse);
+        rayTracingShader.SetInt("_MaxBounces", maxBounces);
+        // 테스트용 구체 데이터 3개 생성
+        List<SphereData> spheres = new List<SphereData>
+        {
+            // 1. 완벽한 투명 유리 구체 (IOR = 1.5, Smoothness = 1.0)
+            new SphereData { position = new Vector3(0.0f, 0.0f, 2.5f),  radius = 1.0f, color = new Vector3(1.0f, 1.0f, 1.0f), smoothness = 1.0f, ior = 1.5f },
+            
+            // 2. 뒤쪽에 배치된 빨간 무광 구체 (유리를 통해 상이 뒤집혀 보임)
+            new SphereData { position = new Vector3(-0.8f, -0.2f, 4.5f), radius = 0.8f, color = new Vector3(0.9f, 0.1f, 0.1f), smoothness = 0.2f, ior = 1.0f },
+            
+            // 3. 우측 크롬 거울 구체
+            new SphereData { position = new Vector3(1.8f, 0.3f, 3.5f),  radius = 0.9f, color = new Vector3(0.9f, 0.9f, 0.9f), smoothness = 0.95f, ior = 1.0f }
+        };
+
+        // ComputeBuffer 생성 및 데이터 전송
+        if (sphereBuffer != null) sphereBuffer.Release();
+        
+        sphereBuffer = new ComputeBuffer(spheres.Count, 36); // 28 bytes per struct
+        sphereBuffer.SetData(spheres);
+
+        rayTracingShader.SetBuffer(0, "_Spheres", sphereBuffer);
+        rayTracingShader.SetInt("_SphereCount", spheres.Count);
+    }
+
+    private void Render(RenderTexture destination)
+    {
+        InitRenderTexture();
+
+        rayTracingShader.SetTexture(0, "Result", target);
+        int threadGroupsX = Mathf.CeilToInt(Screen.width / 8.0f);
+        int threadGroupsY = Mathf.CeilToInt(Screen.height / 8.0f);
+        rayTracingShader.Dispatch(0, threadGroupsX, threadGroupsY, 1);
+
+        Graphics.Blit(target, destination);
+    }
+
+    private void InitRenderTexture()
+    {
+        if (target == null || target.width != Screen.width || target.height != Screen.height)
+        {
+            if (target != null) target.Release();
+
+            target = new RenderTexture(Screen.width, Screen.height, 0,
+                RenderTextureFormat.ARGBFloat, RenderTextureReadWrite.Linear);
+            target.enableRandomWrite = true;
+            target.Create();
+        }
+    }
+}
