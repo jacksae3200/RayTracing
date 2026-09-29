@@ -1,0 +1,211 @@
+#pragma kernel CSMain
+
+RWTexture2D<float4> Result;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+struct Sphere
+{
+    float3 position;
+    float radius;
+    float3 color;
+    float smoothness; 
+    float ior; // 굴절률 (예: 공기 1.0, 물 1.33, 유리 1.5)
+};
+
+StructuredBuffer<Sphere> _Spheres;
+int _SphereCount;
+int _MaxBounces;
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+    float3 energy;
+};
+
+struct RayHit
+{
+    float position;
+    float3 hitPoint;
+    float3 normal;
+    float3 color;
+    float smoothness;
+    float ior;
+};
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = 1e30; // float 최대치에 가까운 큰 값으로 초기화
+    hit.hitPoint = float3(0, 0, 0);
+    hit.normal = float3(0, 0, 0);
+    hit.color = float3(0, 0, 0);
+    hit.smoothness = 0.0f;
+    hit.ior = 1.0f;
+    return hit;
+}
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.energy = float3(1.0f, 1.0f, 1.0f);
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // UV 좌표(-1 ~ 1)를 카메라 클립 공간 좌표로 변환
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+float FresnelSchlick(float cosine, float ior)
+{
+    float r0 = (1.0f - ior) / (1.0f + ior);
+    r0 = r0 * r0;
+    return r0 + (1.0f - r0) * pow(1.0f - cosine, 5.0f);
+}
+
+void IntersectSphere(Ray ray, inout RayHit bestHit, Sphere sphere)
+{
+    float3 d = ray.origin - sphere.position;
+    float p1 = -dot(ray.direction, d);
+    float p2sq = p1 * p1 - dot(d, d) + sphere.radius * sphere.radius;
+    
+    if (p2sq < 0)
+        return; // 교차하지 않음
+        
+    float p2 = sqrt(p2sq);
+    float t = p1 - p2;
+    if (t < 0.001f)
+        t = p1 + p2;
+
+    if (t > 0.001f && t < bestHit.position)
+    {
+        bestHit.position = t;
+        bestHit.hitPoint = ray.origin + ray.direction * t;
+        bestHit.normal = normalize(bestHit.hitPoint - sphere.position);
+        bestHit.color = sphere.color;
+        bestHit.smoothness = sphere.smoothness;
+        bestHit.ior = sphere.ior;
+    }
+}
+
+// 바닥 평면(Ground Plane, y = -1.0) 교차 검사
+void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
+{
+    if (ray.direction.y < 0)
+    {
+        float t = (-1.0f - ray.origin.y) / ray.direction.y;
+        if (t > 0 && t < bestHit.position)
+        {
+            bestHit.position = t;
+            bestHit.hitPoint = ray.origin + ray.direction * t;
+            bestHit.normal = float3(0, 1, 0);
+            
+            // 바닥 체커보드 패턴 계산
+            float2 check = floor(bestHit.hitPoint.xz);
+            float pattern = fmod(check.x + check.y, 2.0);
+            bestHit.color = pattern < 0.5 ? float3(0.8, 0.8, 0.8) : float3(0.3, 0.3, 0.3);
+            bestHit.smoothness = 0.2f;
+            bestHit.ior = 1.0f; //
+        }
+    }
+}
+
+// 씬 내부의 모든 오브젝트와 교차 검사
+RayHit Trace(Ray ray)
+{
+    RayHit bestHit = CreateRayHit();
+    
+    // 바닥 체크
+    IntersectGroundPlane(ray, bestHit);
+    
+    // 모든 구체 체크
+    for (int i = 0; i < _SphereCount; i++)
+    {
+        IntersectSphere(ray, bestHit, _Spheres[i]);
+    }
+    
+    return bestHit;
+}
+
+bool TraceShadow(Ray shadowRay, float maxDistance)
+{
+    // 1. 바닥과의 자가 차폐/교차 검사 (필요 시)
+    // 2. 구체들과의 교차 검사
+    for (int i = 0; i < _SphereCount; i++)
+    {
+        RayHit shadowHit = CreateRayHit();
+        IntersectSphere(shadowRay, shadowHit, _Spheres[i]);
+        
+        // 광원 방향으로 향하는 도중 다른 구체와 충돌하면 그림자 영역
+        if (shadowHit.position < maxDistance)
+        {
+            return true; // 차폐됨 (In Shadow)
+        }
+    }
+    return false; // 광원까지 직접 도달 (Lit)
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    float2 uv = float2((id.xy + 0.5f) / float2(width, height)) * 2.0f - 1.0f;
+
+    Ray ray = CreateCameraRay(uv);
+    float3 resultColor = float3(0, 0, 0);
+    float3 lightDir = normalize(float3(0.5, 1.0, -0.5));
+
+    // -------------------------------------------------------------
+    // Reflection Bounce Loop (바운스 루프)
+    // -------------------------------------------------------------
+    for (int i = 0; i < _MaxBounces; i++)
+    {
+        RayHit hit = Trace(ray);
+
+        if (hit.position < 1e29)
+        {
+            // 1. Direct Lighting & Shadow 연산
+            Ray shadowRay = CreateRay(hit.hitPoint + hit.normal * 0.001f, lightDir);
+            bool inShadow = TraceShadow(shadowRay, 1e30);
+            
+            float NdotL = max(0.0f, dot(hit.normal, lightDir));
+            float shadowFactor = inShadow ? 0.1f : max(0.1f, NdotL);
+            
+            // 난반사(Diffuse) 색상 계산 및 에너지 축적
+            float3 diffuseColor = hit.color * shadowFactor;
+            resultColor += ray.energy * diffuseColor * (1.0f - hit.smoothness);
+
+            // 2. Next Ray 준비 (거울 반사 계산)
+            ray.origin = hit.hitPoint + hit.normal * 0.001f;
+            ray.direction = reflect(ray.direction, hit.normal);
+            
+            // 반사될수록 레이의 에너지는 물체의 매끄러움(smoothness)과 기본 색상에 종속됨
+            ray.energy *= hit.smoothness * hit.color;
+
+            // 에너지(빛)가 모두 소진되면 루프 조기 탈출
+            if (!any(ray.energy))
+                break;
+        }
+        else
+        {
+            // 미충돌 시 하늘색 배경을 반사 에너지와 곱해서 더함
+            float3 skyColor = float3(0.5f, 0.7f, 0.9f);
+            resultColor += ray.energy * skyColor;
+            break;
+        }
+    }
+
+    Result[id.xy] = float4(resultColor, 1.0f);
+}
